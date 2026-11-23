@@ -20,6 +20,12 @@ def seed_if_needed(db_path: str | None = None) -> None:
             ("default_visit_codes", "V1,V2,V3,EOT", "默认访视编码清单"),
             ("crawl_page_size", "20", "模拟抓取每批条数"),
             ("clinic_timezone", "Asia/Shanghai", "台账时区"),
+            (
+                "idempotency_key_spec",
+                "业务键口径=批次ID:受试者键:访视编码；钤印=sha256(scope|batch|subject|visit|idem_key)；"
+                "状态旗=现行/已归档；同键重放挡回刷，戳记拧花拒绝",
+                "幂等键口径（只读，由幂等账册执行）",
+            ),
         ]
         conn.executemany(
             "INSERT OR IGNORE INTO app_settings(key, value, label) VALUES (?,?,?)",

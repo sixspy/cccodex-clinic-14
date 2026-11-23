@@ -56,14 +56,18 @@ def test_create_batch_append_row(db_path):
         db_path=db_path,
     )
     assert bad["quality"] == "缺字段"
-    with pytest.raises(ServiceError):
-        visits.add_visit_row(
-            batch["id"],
-            "T-9001",
-            "V1",
-            payload="{}",
-            db_path=db_path,
-        )
+    # 幂等化后：同业务键再次追加不再报错，而是命中账册重放、不新增行
+    before = visits.get_batch(batch["id"], db_path=db_path)["item_count"]
+    replayed = visits.add_visit_row(
+        batch["id"],
+        "T-9001",
+        "V1",
+        payload="{}",
+        db_path=db_path,
+    )
+    assert replayed["id"] == ok["id"]
+    assert replayed["replay"] is True
+    assert visits.get_batch(batch["id"], db_path=db_path)["item_count"] == before
 
 
 def test_disabled_site_cannot_open_batch(db_path):

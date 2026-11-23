@@ -39,6 +39,8 @@ def update_setting(key: str, value: str, db_path: str | None = None) -> dict:
         ).fetchone()
         if not row:
             raise ServiceError("设置项不存在", 404)
+        if key == "idempotency_key_spec":
+            raise ServiceError("幂等键口径为只读项，由幂等账册服务执行，不能改写")
         if key in ("qc_auto_scan", "backfill_max_attempt", "site_quota_warn"):
             if not value.isdigit():
                 raise ServiceError("该设置必须是数字")

@@ -39,7 +39,7 @@ export async function renderVisits(el) {
         <thead>
           <tr>
             <th>批次编码</th><th>中心</th><th>方案</th><th>状态</th>
-            <th>行数</th><th>缺口</th><th>备注</th><th>操作</th>
+            <th>行数</th><th>缺口</th><th>幂等徽标</th><th>追加次数</th><th>备注</th><th>操作</th>
           </tr>
         </thead>
         <tbody id="batchBody">
@@ -50,7 +50,40 @@ export async function renderVisits(el) {
     <div class="card">
       <h2>批次详情与访视行</h2>
       <div id="batchDetail" class="muted">点击「查看」加载批次内访视行与质量分布。</div>
+    </div>
+    <div class="card">
+      <h2>幂等键账册（旁路台账）</h2>
+      <p class="muted">读轨只认本账册现行旗：同键重放挡回刷、戳记拧花拦截、争用不加锁不双写。批次关闭后可归档收口为只读档。</p>
+      <div class="row">
+        <button id="idemReload" class="ghost">刷新账册</button>
+        <button id="idemSeal" class="warn">归档已关闭批次（乙路收口）</button>
+      </div>
+      <div class="row">
+        <button class="tab-btn active" data-idem-tab="queue">幂等键队列（现行）</button>
+        <button class="tab-btn" data-idem-tab="archive">只读归档</button>
+      </div>
+      <div id="idemMsg" class="muted"></div>
+      <div id="idemPanel"><p class="muted">在批次详情选择批次后展示该批幂等键落点。</p></div>
     </div>`;
+
+  function idemBadge(b) {
+    if (b.idem_riveted) {
+      const archived = b.idem_archived > 0;
+      return `<span class="chip ${archived ? 'idle' : 'ok'}">幂等铆键${archived ? '·部分归档' : ''}</span>`;
+    }
+    return '<span class="chip idle">未铆键</span>';
+  }
+
+  function appendCell(b) {
+    const attempts = b.append_attempts || 0;
+    const keys = b.idem_keys || 0;
+    // 徽标对照追加次数：重放次数 > 0 即出现拧花警示，提示重复追加已被拦
+    const replays = Math.max(0, attempts - keys);
+    if (replays > 0) {
+      return `<span class="chip warn" title="含 ${replays} 次重复追加已被幂等拦截">${attempts}（重放×${replays}）</span>`;
+    }
+    return `<span>${attempts}</span>`;
+  }
 
   function batchRow(b) {
     return `
@@ -61,6 +94,8 @@ export async function renderVisits(el) {
         <td>${chip(b.status)}</td>
         <td>${b.item_count}</td>
         <td>${b.gap_count}</td>
+        <td>${idemBadge(b)}</td>
+        <td>${appendCell(b)}</td>
         <td class="muted">${escapeHtml(b.note || '')}</td>
         <td class="row">
           <button data-view="${b.id}" class="ghost">查看</button>
@@ -74,10 +109,82 @@ export async function renderVisits(el) {
 
   const detail = el.querySelector('#batchDetail');
   const showErr = (msg) => { detail.innerHTML = `<p class="err">${escapeHtml(msg)}</p>`; };
+  let currentBatchId = null;
+  let idemTab = 'queue';
+
+  async function loadIdemPanel() {
+    const panel = el.querySelector('#idemPanel');
+    if (!panel) return;
+    if (!currentBatchId) {
+      panel.innerHTML = '<p class="muted">在批次详情选择批次后展示该批幂等键落点。</p>';
+      return;
+    }
+    if (idemTab === 'archive') {
+      const data = await api(`/api/idempotency/archive?batch_id=${currentBatchId}`);
+      const items = data.items || [];
+      panel.innerHTML = `
+        <table>
+          <thead><tr><th>幂等键（只读）</th><th>受试者/访视</th><th>落点行</th><th>追加次数</th><th>归档时间</th></tr></thead>
+          <tbody>
+            ${items.map((x) => `
+              <tr>
+                <td><code class="idem-key">${escapeHtml(x.idem_key)}</code></td>
+                <td>${escapeHtml(x.subject_key)} / ${escapeHtml(x.visit_code)}</td>
+                <td>#${x.row_id}</td>
+                <td>${x.attempt_count}</td>
+                <td class="muted">${escapeHtml(x.archived_at || '')}</td>
+              </tr>`).join('') || '<tr><td colspan="5" class="muted">该批暂无已归档档</td></tr>'}
+          </tbody>
+        </table>`;
+      return;
+    }
+    const data = await api(`/api/idempotency/ledger?batch_id=${currentBatchId}&status_flag=${encodeURIComponent('现行')}`);
+    const items = data.items || [];
+    panel.innerHTML = `
+      <table>
+        <thead><tr><th>幂等键</th><th>受试者/访视</th><th>落点行</th><th>状态旗</th><th>追加次数</th><th>钤印（前16位）</th></tr></thead>
+        <tbody>
+          ${items.map((x) => `
+            <tr>
+              <td><code class="idem-key">${escapeHtml(x.idem_key)}</code></td>
+              <td>${escapeHtml(x.subject_key)} / ${escapeHtml(x.visit_code)}</td>
+              <td>#${x.row_id}</td>
+              <td>${chip(x.status_flag)}</td>
+              <td>${x.attempt_count}${x.attempt_count > 1 ? ' <span class="chip warn">含重放</span>' : ''}</td>
+              <td class="muted">${escapeHtml((x.stamp || '').slice(0, 16))}…</td>
+            </tr>`).join('') || '<tr><td colspan="6" class="muted">该批现行账册为空（批次关闭归档后在此页签消失）</td></tr>'}
+        </tbody>
+      </table>`;
+  }
+
+  el.querySelectorAll('[data-idem-tab]').forEach((btn) => {
+    btn.onclick = () => {
+      idemTab = btn.dataset.idemTab;
+      el.querySelectorAll('[data-idem-tab]').forEach((b) => b.classList.toggle('active', b === btn));
+      loadIdemPanel().catch((e) => {
+        el.querySelector('#idemMsg').textContent = e.message;
+      });
+    };
+  });
+  el.querySelector('#idemReload').onclick = () => loadIdemPanel().catch((e) => {
+    el.querySelector('#idemMsg').textContent = e.message;
+  });
+  el.querySelector('#idemSeal').onclick = async () => {
+    const msg = el.querySelector('#idemMsg');
+    try {
+      const r = await api('/api/idempotency/seal', { method: 'POST', body: '{}' });
+      msg.className = 'muted';
+      msg.textContent = `归档收口完成，迁入只读档 ${r.archived} 笔。`;
+      await softReload();
+      await loadIdemPanel();
+    } catch (e) { msg.className = 'err'; msg.textContent = e.message; }
+  };
 
   async function loadDetail(id) {
     const b = await api(`/api/batches/${id}`);
+    currentBatchId = id;
     const qs = b.quality_stats || {};
+    const idem = b.idem_summary || { keys: 0, attempts: 0, archived: 0, riveted: false };
     detail.innerHTML = `
       <div class="row">
         <strong>${escapeHtml(b.batch_code)}</strong>
@@ -90,10 +197,21 @@ export async function renderVisits(el) {
         <div class="stat"><div class="n">${qs['合格'] || 0}</div><div class="l">合格</div></div>
         <div class="stat"><div class="n">${(qs['缺字段'] || 0) + (qs['编码空'] || 0) + (qs['重复键'] || 0)}</div><div class="l">异常质量</div></div>
       </div>
+      <div class="card idem-summary">
+        <h2 style="font-size:15px">幂等摘要台</h2>
+        <div class="grid">
+          <div class="stat"><div class="n">${idem.riveted ? '<span class="chip ok">已铆键</span>' : '<span class="chip idle">未铆键</span>'}</div><div class="l">幂等徽标</div></div>
+          <div class="stat"><div class="n">${idem.keys}</div><div class="l">幂等键落点</div></div>
+          <div class="stat"><div class="n">${idem.attempts}</div><div class="l">累计追加次数</div></div>
+          <div class="stat"><div class="n">${idem.archived}</div><div class="l">已归档档</div></div>
+        </div>
+        <p class="muted">口径：业务键=批次ID:受试者键:访视编码；钤印 sha256；同键重放挡回刷，戳记拧花拦截。</p>
+      </div>
       <div class="row">
         <input id="subjectKey" placeholder="受试者键" />
         <input id="visitCode" placeholder="访视编码" value="V1" style="width:90px" />
         <input id="payload" placeholder='载荷 JSON，如 {"visit_date":"2026-11-20","investigator":"王医生","weight_kg":60}' style="min-width:320px" />
+        <input id="idemKey" placeholder="幂等键（留空按口径自动生成）" style="min-width:220px" />
         <select id="qualityForce">
           <option value="">自动推断质量</option>
           <option>合格</option>
@@ -106,7 +224,7 @@ export async function renderVisits(el) {
         <button id="enqueueGaps">缺口排队补采</button>
       </div>
       <table>
-        <thead><tr><th>ID</th><th>受试者</th><th>访视</th><th>质量</th><th>状态</th><th>载荷摘要</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>受试者</th><th>访视</th><th>质量</th><th>状态</th><th>幂等键落点</th><th>追加次数</th><th>载荷摘要</th><th>操作</th></tr></thead>
         <tbody>
           ${(b.items || []).map((r) => `
             <tr>
@@ -115,29 +233,36 @@ export async function renderVisits(el) {
               <td>${escapeHtml(r.visit_code)}</td>
               <td>${chip(r.quality)}</td>
               <td>${chip(r.status)}</td>
+              <td>${r.idem_key ? `<code class="idem-key">${escapeHtml(r.idem_key)}</code><div>${chip(r.idem_flag || '现行')}</div>` : '<span class="chip idle">无落点</span>'}</td>
+              <td>${r.idem_attempts || 1}</td>
               <td class="muted">${escapeHtml((r.payload || '').slice(0, 80))}</td>
               <td class="row">
                 <button data-enqueue-row="${r.id}" ${r.quality === '合格' && r.status === '已入库' ? 'disabled' : ''}>排队补采</button>
                 <button data-mark="${r.id}" data-st="待补采" class="ghost">标待补采</button>
               </td>
-            </tr>`).join('') || '<tr><td colspan="7" class="muted">暂无访视行</td></tr>'}
+            </tr>`).join('') || '<tr><td colspan="9" class="muted">暂无访视行</td></tr>'}
         </tbody>
       </table>`;
 
     detail.querySelector('#addRow').onclick = async () => {
       try {
         const q = detail.querySelector('#qualityForce').value;
-        await api(`/api/batches/${id}/items`, {
+        const idemInput = detail.querySelector('#idemKey').value.trim();
+        const r = await api(`/api/batches/${id}/items`, {
           method: 'POST',
+          headers: idemInput ? { 'Idempotency-Key': idemInput } : {},
           body: JSON.stringify({
             subject_key: detail.querySelector('#subjectKey').value,
             visit_code: detail.querySelector('#visitCode').value,
             payload: detail.querySelector('#payload').value,
             quality: q || null,
+            idem_key: idemInput || null,
           }),
         });
+        showErr(r.replay ? `幂等拦截：该键为重复追加，已回放首笔结果（第 ${r.attempt_count} 次），未新增行。` : '');
         await loadDetail(id);
         await softReload();
+        await loadIdemPanel();
       } catch (e) { showErr(e.message); }
     };
     detail.querySelector('#runQc').onclick = async () => {
@@ -184,7 +309,11 @@ export async function renderVisits(el) {
 
   function bindBatchActions() {
     el.querySelectorAll('[data-view]').forEach((btn) => {
-      btn.onclick = () => loadDetail(btn.dataset.view).catch((e) => showErr(e.message));
+      btn.onclick = () => {
+        loadDetail(btn.dataset.view)
+          .then(() => loadIdemPanel())
+          .catch((e) => showErr(e.message));
+      };
     });
     el.querySelectorAll('[data-crawl]').forEach((btn) => {
       btn.onclick = async () => {
@@ -220,6 +349,7 @@ export async function renderVisits(el) {
         try {
           await api(`/api/batches/${btn.dataset.close}/close`, { method: 'POST', body: '{}' });
           await softReload();
+          await loadIdemPanel();
         } catch (e) { showErr(e.message); }
       };
     });
@@ -241,4 +371,5 @@ export async function renderVisits(el) {
   el.querySelector('#reload').onclick = () => softReload().catch((e) => showErr(e.message));
   el.querySelector('#statusFilter').onchange = () => softReload().catch((e) => showErr(e.message));
   bindBatchActions();
+  loadIdemPanel().catch(() => {});
 }

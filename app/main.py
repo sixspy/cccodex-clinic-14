@@ -11,6 +11,7 @@ from app.config import Config
 from app.seed import seed_if_needed
 from app.services import audit as audit_svc
 from app.services import backfill as backfill_svc
+from app.services import idempotency as idem_svc
 from app.services import protocols as protocols_svc
 from app.services import qc as qc_svc
 from app.services import reconcile as reconcile_svc
@@ -279,6 +280,7 @@ class Api:
         bid = int(batch_id)
         if action == "items" and method == "POST":
             body = _read_json()
+            header_key = cherrypy.request.headers.get("Idempotency-Key", "")
             return _json(
                 visits_svc.add_visit_row(
                     bid,
@@ -286,6 +288,7 @@ class Api:
                     body.get("visit_code", ""),
                     body.get("payload", ""),
                     body.get("quality"),
+                    body.get("idem_key") or header_key or None,
                 )
             )
         if action == "crawl" and method == "POST":
@@ -449,6 +452,32 @@ class Api:
             {"items": audit_svc.list_events(limit), "summary": audit_svc.summary()}
         )
 
+    @cherrypy.expose
+    @_wrap
+    def idempotency(self, action=None):
+        _require()
+        method = cherrypy.request.method
+        q = _query()
+        if action == "ledger" and method == "GET":
+            batch_id = int(q["batch_id"]) if q.get("batch_id") else None
+            flag = q.get("status_flag", "现行")
+            return _json(
+                {
+                    "items": idem_svc.list_ledger(
+                        batch_id=batch_id, status_flag=flag
+                    ),
+                    "summary": idem_svc.summary_for_batch(batch_id) if batch_id else {},
+                }
+            )
+        if action == "archive" and method == "GET":
+            batch_id = int(q["batch_id"]) if q.get("batch_id") else None
+            return _json({"items": idem_svc.list_archive(batch_id=batch_id)})
+        if action == "seal" and method == "POST":
+            return _json(idem_svc.archive_closed_batches())
+        if action == "spec" and method == "GET":
+            return _json(settings_svc.get_setting("idempotency_key_spec"))
+        return _json({"error": "未知幂等账册路由"}, 404)
+
 
 class ApiMount:
     """Flat REST dispatcher mounted at /api."""
@@ -521,6 +550,11 @@ class ApiMount:
             return api.settings(action=parts[1])
         if path == "/audits" or path.startswith("/audits"):
             return api.audits()
+        if path == "/idempotency" or path.startswith("/idempotency/"):
+            parts = path.strip("/").split("/")
+            if len(parts) >= 2:
+                return api.idempotency(action=parts[1])
+            return _json({"error": "未知幂等账册路由"}, 404)
         return _json({"error": f"未知接口 {path}"}, 404)
 
 

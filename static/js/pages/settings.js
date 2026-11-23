@@ -6,6 +6,11 @@ export async function renderSettings(el) {
   const snapshot = data.snapshot || {};
 
   el.innerHTML = `
+    <div class="card idem-summary">
+      <h2>幂等键口径（只展口径，执行在旁路账册）</h2>
+      <p class="muted">台参数仅展示幂等键口径，不提供改写；铆键、钤印、挡回刷与归档均由访视批次页的幂等账册落地。</p>
+      <div class="detail-box" id="idemSpec">加载中…</div>
+    </div>
     <div class="card">
       <h2>台参数</h2>
       <p class="muted">控制质控自动扫描开关、补采最大次数、配额告警与对账口径标签等。修改会写审计。</p>
@@ -25,8 +30,12 @@ export async function renderSettings(el) {
               <td><code>${escapeHtml(s.key)}</code></td>
               <td>${escapeHtml(s.label)}</td>
               <td><strong>${escapeHtml(s.value)}</strong></td>
-              <td><input data-key="${escapeHtml(s.key)}" value="${escapeHtml(s.value)}" /></td>
-              <td><button data-save="${escapeHtml(s.key)}">保存</button></td>
+              <td>${s.key === 'idempotency_key_spec'
+                ? '<span class="muted">只读口径项</span>'
+                : `<input data-key="${escapeHtml(s.key)}" value="${escapeHtml(s.value)}" />`}</td>
+              <td>${s.key === 'idempotency_key_spec'
+                ? '<span class="chip idle">不开放编辑</span>'
+                : `<button data-save="${escapeHtml(s.key)}">保存</button>`}</td>
             </tr>`).join('')}
         </tbody>
       </table>
@@ -44,6 +53,17 @@ export async function renderSettings(el) {
     </div>`;
 
   const msg = el.querySelector('#msg');
+  api('/api/idempotency/spec')
+    .then((spec) => {
+      const box = el.querySelector('#idemSpec');
+      if (box) {
+        box.textContent = `键名：${spec.key}\n说明：${spec.label}\n口径：${spec.value}`;
+      }
+    })
+    .catch((e) => {
+      const box = el.querySelector('#idemSpec');
+      if (box) box.textContent = '口径加载失败：' + e.message;
+    });
   el.querySelectorAll('[data-save]').forEach((btn) => {
     btn.onclick = async () => {
       const key = btn.dataset.save;

@@ -6,6 +6,7 @@ from datetime import datetime
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import idempotency as idem_svc
 from app.services import protocols as protocols_svc
 from app.services.errors import ServiceError
 
@@ -48,19 +49,35 @@ def list_batches(
         params.append(status)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     with get_db(db_path) as conn:
+        idem_svc.backfill_legacy(db_path)
         rows = conn.execute(
             f"""
             SELECT b.*, s.name AS site_name, s.site_code,
-                   p.protocol_code, p.version AS protocol_version
+                   p.protocol_code, p.version AS protocol_version,
+                   COALESCE(ia.keys, 0) AS idem_keys,
+                   COALESCE(ia.attempts, 0) AS append_attempts,
+                   COALESCE(ia.archived, 0) AS idem_archived,
+                   CASE WHEN COALESCE(ia.keys, 0) > 0 THEN 1 ELSE 0 END AS idem_riveted
             FROM visit_batches b
             JOIN trial_sites s ON s.id=b.site_id
             LEFT JOIN protocols p ON p.id=b.protocol_id
+            LEFT JOIN (
+              SELECT batch_id,
+                     COUNT(*) AS keys,
+                     SUM(attempt_count) AS attempts,
+                     SUM(CASE WHEN status_flag='已归档' THEN 1 ELSE 0 END) AS archived
+              FROM idempotency_ledger
+              GROUP BY batch_id
+            ) ia ON ia.batch_id=b.id
             {where}
             ORDER BY b.id DESC
             """,
             params,
         ).fetchall()
-        return [dict(r) for r in rows]
+        items = [dict(r) for r in rows]
+        for item in items:
+            item["idem_riveted"] = bool(item["idem_riveted"])
+        return items
 
 
 def get_batch(batch_id: int, db_path: str | None = None) -> dict:
@@ -78,11 +95,14 @@ def get_batch(batch_id: int, db_path: str | None = None) -> dict:
         ).fetchone()
         if not row:
             raise ServiceError("访视批次不存在", 404)
+        idem_svc.backfill_legacy(db_path)
         items = conn.execute(
             """
-            SELECT * FROM visit_rows
-            WHERE batch_id=?
-            ORDER BY id
+            SELECT r.*, l.idem_key, l.status_flag AS idem_flag, l.attempt_count AS idem_attempts
+            FROM visit_rows r
+            LEFT JOIN idempotency_ledger l ON l.row_id=r.id
+            WHERE r.batch_id=?
+            ORDER BY r.id
             """,
             (batch_id,),
         ).fetchall()
@@ -97,6 +117,7 @@ def get_batch(batch_id: int, db_path: str | None = None) -> dict:
         data = dict(row)
         data["items"] = [dict(i) for i in items]
         data["quality_stats"] = {r["quality"]: r["c"] for r in quality_stats}
+        data["idem_summary"] = idem_svc.summary_for_batch(batch_id, db_path)
         return data
 
 
@@ -174,14 +195,15 @@ def _infer_quality(payload: str, subject_key: str, visit_code: str, required: li
     return "合格"
 
 
-def add_visit_row(
+def _append_visit_row_core(
+    conn,
     batch_id: int,
     subject_key: str,
     visit_code: str,
     payload: str = "",
     quality: str | None = None,
-    db_path: str | None = None,
 ) -> dict:
+    """追加访视行的业务核心，运行在调用方既有连接/事务内，不自行提交。"""
     subject_key = (subject_key or "").strip()
     visit_code = (visit_code or "").strip().upper()
     payload = payload if payload is not None else ""
@@ -191,83 +213,104 @@ def add_visit_row(
         raise ServiceError("受试者键格式无效")
     if not visit_code:
         raise ServiceError("访视编码不能空")
-    with get_db(db_path) as conn:
-        batch = conn.execute(
-            "SELECT * FROM visit_batches WHERE id=?", (batch_id,)
+    batch = conn.execute(
+        "SELECT * FROM visit_batches WHERE id=?", (batch_id,)
+    ).fetchone()
+    if not batch:
+        raise ServiceError("访视批次不存在", 404)
+    if batch["status"] == "已关闭":
+        raise ServiceError("已关闭批次不能追加访视行")
+    site = conn.execute(
+        "SELECT * FROM trial_sites WHERE id=?", (batch["site_id"],)
+    ).fetchone()
+    if site and site["quota"] > 0:
+        if batch["item_count"] >= site["quota"]:
+            raise ServiceError("已达中心配额上限，不能再追加")
+    required = ["subject_key", "visit_code", "visit_date", "investigator"]
+    if batch["protocol_id"]:
+        proto = conn.execute(
+            "SELECT required_fields FROM protocols WHERE id=?",
+            (batch["protocol_id"],),
         ).fetchone()
-        if not batch:
-            raise ServiceError("访视批次不存在", 404)
-        if batch["status"] == "已关闭":
-            raise ServiceError("已关闭批次不能追加访视行")
-        site = conn.execute(
-            "SELECT * FROM trial_sites WHERE id=?", (batch["site_id"],)
-        ).fetchone()
-        if site and site["quota"] > 0:
-            if batch["item_count"] >= site["quota"]:
-                raise ServiceError("已达中心配额上限，不能再追加")
-        required = ["subject_key", "visit_code", "visit_date", "investigator"]
-        if batch["protocol_id"]:
-            proto = conn.execute(
-                "SELECT required_fields FROM protocols WHERE id=?",
-                (batch["protocol_id"],),
-            ).fetchone()
-            if proto:
-                try:
-                    parsed = json.loads(proto["required_fields"] or "[]")
-                    if isinstance(parsed, list) and parsed:
-                        required = [str(x) for x in parsed]
-                except json.JSONDecodeError:
-                    pass
-        dup = conn.execute(
-            """
-            SELECT id FROM visit_rows
-            WHERE batch_id=? AND subject_key=? AND visit_code=?
-            """,
-            (batch_id, subject_key, visit_code),
-        ).fetchone()
-        if dup:
-            raise ServiceError("同批受试者访视键已存在（重复键）")
-        if quality:
-            if quality not in ROW_QUALITY:
-                raise ServiceError("质量标记无效")
-            q = quality
-        else:
-            q = _infer_quality(payload, subject_key, visit_code, required)
-        # soft duplicate across open batches for same site
-        soft = conn.execute(
-            """
-            SELECT r.id FROM visit_rows r
-            JOIN visit_batches b ON b.id=r.batch_id
-            WHERE b.site_id=? AND b.id!=? AND b.status!='已关闭'
-              AND r.subject_key=? AND r.visit_code=?
-            LIMIT 1
-            """,
-            (batch["site_id"], batch_id, subject_key, visit_code),
-        ).fetchone()
-        if soft and q == "合格":
-            q = "重复键"
-        cur = conn.execute(
-            """
-            INSERT INTO visit_rows(batch_id, subject_key, visit_code, payload, quality, status)
-            VALUES (?, ?, ?, ?, ?, '待检')
-            """,
-            (batch_id, subject_key, visit_code, payload, q),
+        if proto:
+            try:
+                parsed = json.loads(proto["required_fields"] or "[]")
+                if isinstance(parsed, list) and parsed:
+                    required = [str(x) for x in parsed]
+            except json.JSONDecodeError:
+                pass
+    dup = conn.execute(
+        """
+        SELECT id FROM visit_rows
+        WHERE batch_id=? AND subject_key=? AND visit_code=?
+        """,
+        (batch_id, subject_key, visit_code),
+    ).fetchone()
+    if dup:
+        raise ServiceError("同批受试者访视键已存在（重复键）")
+    if quality:
+        if quality not in ROW_QUALITY:
+            raise ServiceError("质量标记无效")
+        q = quality
+    else:
+        q = _infer_quality(payload, subject_key, visit_code, required)
+    # soft duplicate across open batches for same site
+    soft = conn.execute(
+        """
+        SELECT r.id FROM visit_rows r
+        JOIN visit_batches b ON b.id=r.batch_id
+        WHERE b.site_id=? AND b.id!=? AND b.status!='已关闭'
+          AND r.subject_key=? AND r.visit_code=?
+        LIMIT 1
+        """,
+        (batch["site_id"], batch_id, subject_key, visit_code),
+    ).fetchone()
+    if soft and q == "合格":
+        q = "重复键"
+    cur = conn.execute(
+        """
+        INSERT INTO visit_rows(batch_id, subject_key, visit_code, payload, quality, status)
+        VALUES (?, ?, ?, ?, ?, '待检')
+        """,
+        (batch_id, subject_key, visit_code, payload, q),
+    )
+    row_id = cur.lastrowid
+    _refresh_batch_counts(conn, batch_id)
+    if batch["status"] == "已收齐":
+        conn.execute(
+            "UPDATE visit_batches SET status='采集中' WHERE id=?", (batch_id,)
         )
-        row_id = cur.lastrowid
-        _refresh_batch_counts(conn, batch_id)
-        if batch["status"] == "已收齐":
-            conn.execute(
-                "UPDATE visit_batches SET status='采集中' WHERE id=?", (batch_id,)
-            )
-        row = conn.execute("SELECT * FROM visit_rows WHERE id=?", (row_id,)).fetchone()
-    audit_svc.write_event(
-        "追加访视行",
-        "visit_row",
-        row_id,
-        f"{subject_key}/{visit_code}:{q}",
+    return dict(conn.execute("SELECT * FROM visit_rows WHERE id=?", (row_id,)).fetchone())
+
+
+def add_visit_row(
+    batch_id: int,
+    subject_key: str,
+    visit_code: str,
+    payload: str = "",
+    quality: str | None = None,
+    idem_key: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    # 幂等键当场铆死：账册唯一键 + 写锁 + 钤印，整笔同事务提交
+    result = idem_svc.append_visit_row_idempotent(
+        batch_id,
+        subject_key,
+        visit_code,
+        payload=payload,
+        quality=quality,
+        idem_key=idem_key,
         db_path=db_path,
     )
-    return dict(row)
+    if not result.get("replay"):
+        audit_svc.write_event(
+            "追加访视行",
+            "visit_row",
+            result["id"],
+            f"{result.get('subject_key', subject_key)}/{visit_code}:{result.get('quality')}",
+            db_path=db_path,
+        )
+    return result
 
 
 def mock_crawl(
@@ -420,10 +463,12 @@ def list_rows(
     with get_db(db_path) as conn:
         rows = conn.execute(
             f"""
-            SELECT r.*, b.batch_code, b.site_id, s.name AS site_name
+            SELECT r.*, b.batch_code, b.site_id, s.name AS site_name,
+                   l.idem_key, l.status_flag AS idem_flag, l.attempt_count AS idem_attempts
             FROM visit_rows r
             JOIN visit_batches b ON b.id=r.batch_id
             JOIN trial_sites s ON s.id=b.site_id
+            LEFT JOIN idempotency_ledger l ON l.row_id=r.id
             {where}
             ORDER BY r.id DESC
             LIMIT 500

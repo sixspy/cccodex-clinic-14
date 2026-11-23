@@ -103,6 +103,41 @@ CREATE TABLE IF NOT EXISTS app_settings (
   label TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS idempotency_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  idem_key TEXT NOT NULL UNIQUE,
+  scope TEXT NOT NULL,
+  batch_id INTEGER NOT NULL REFERENCES visit_batches(id),
+  subject_key TEXT NOT NULL,
+  visit_code TEXT NOT NULL,
+  row_id INTEGER REFERENCES visit_rows(id),
+  stamp TEXT NOT NULL,
+  status_flag TEXT NOT NULL DEFAULT '现行'
+    CHECK (status_flag IN ('现行','已归档')),
+  attempt_count INTEGER NOT NULL DEFAULT 1,
+  last_result TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_idem_ledger_batch
+  ON idempotency_ledger(batch_id, status_flag);
+
+CREATE TABLE IF NOT EXISTS idempotency_archive (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ledger_id INTEGER NOT NULL,
+  idem_key TEXT NOT NULL UNIQUE,
+  scope TEXT NOT NULL,
+  batch_id INTEGER NOT NULL,
+  subject_key TEXT NOT NULL,
+  visit_code TEXT NOT NULL,
+  row_id INTEGER,
+  stamp TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 1,
+  last_result TEXT NOT NULL DEFAULT '',
+  archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
